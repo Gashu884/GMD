@@ -85,6 +85,7 @@
       </label>
       <button id="apply-threshold" disabled>閾値を適用</button>
       <button id="auto-threshold" disabled>自動閾値 (大津)</button>
+      <button id="fill-holes" disabled>穴埋め (Fill Holes)</button>
     </div>
     <p id="status">OpenCV.js のロードを待機しています...</p>
     <p id="count-result"></p>
@@ -112,6 +113,23 @@
     <canvas id="histogram-chart" height="160"></canvas>
   </div>
 
+  <div class="panel">
+    <div class="controls">
+      <label>
+        スケール (単位/px):
+        <input type="number" id="scale-value" value="1" min="0" step="0.01" disabled>
+      </label>
+      <label>
+        対象サイズ (最小):
+        <input type="number" id="min-size" value="0" min="0" step="0.1" disabled>
+      </label>
+      <label>
+        対象サイズ (最大):
+        <input type="number" id="max-size" value="0" min="0" step="0.1" disabled placeholder="0で制限なし">
+      </label>
+    </div>
+  </div>
+
   <img id="hidden-image" style="display:none;" alt="source">
   <canvas id="hidden-canvas" style="display:none;"></canvas>
 
@@ -119,7 +137,7 @@
     let cvReady = false;
     let chartInstance = null;
 
-    let srcMat, grayMat, blurMat, binaryMat, cleanedMat, annotatedMat;
+    let srcMat, grayMat, invertedMat, blurMat, currentBinaryMat, annotatedMat;
 
     const fileInput = document.getElementById('file-input');
     const thresholdSlider = document.getElementById('threshold-slider');
@@ -127,10 +145,14 @@
     const minAreaInput = document.getElementById('min-area');
     const applyButton = document.getElementById('apply-threshold');
     const autoButton = document.getElementById('auto-threshold');
+    const fillButton = document.getElementById('fill-holes');
     const statusLabel = document.getElementById('status');
     const countLabel = document.getElementById('count-result');
     const hiddenImage = document.getElementById('hidden-image');
     const hiddenCanvas = document.getElementById('hidden-canvas');
+    const scaleInput = document.getElementById('scale-value');
+    const minSizeInput = document.getElementById('min-size');
+    const maxSizeInput = document.getElementById('max-size');
 
     window.Module = {
       onRuntimeInitialized() {
@@ -143,15 +165,19 @@
       minAreaInput.disabled = !enabled;
       applyButton.disabled = !enabled;
       autoButton.disabled = !enabled;
+      fillButton.disabled = !enabled;
+      scaleInput.disabled = !enabled;
+      minSizeInput.disabled = !enabled;
+      maxSizeInput.disabled = !enabled;
     }
 
     function cleanupMats() {
-      [srcMat, grayMat, blurMat, binaryMat, cleanedMat, annotatedMat].forEach(mat => {
+      [srcMat, grayMat, invertedMat, blurMat, currentBinaryMat, annotatedMat].forEach(mat => {
         if (mat) {
           mat.delete();
         }
       });
-      srcMat = grayMat = blurMat = binaryMat = cleanedMat = annotatedMat = null;
+      srcMat = grayMat = invertedMat = blurMat = currentBinaryMat = annotatedMat = null;
     }
 
     function drawMat(mat, canvasId) {
@@ -236,14 +262,14 @@
       chartInstance.update();
     }
 
-    function processImage(threshold, auto = false) {
-      if (!grayMat) return;
+    function processThreshold(threshold, auto = false) {
+      if (!invertedMat) return;
 
       const minArea = Math.max(parseInt(minAreaInput.value, 10) || 0, 0);
 
       if (blurMat) blurMat.delete();
       blurMat = new cv.Mat();
-      cv.GaussianBlur(grayMat, blurMat, new cv.Size(5, 5), 0);
+      cv.GaussianBlur(invertedMat, blurMat, new cv.Size(5, 5), 0);
 
       const thresholdType = cv.THRESH_BINARY;
       if (auto) {
@@ -257,22 +283,46 @@
         threshold = Math.max(0, Math.min(255, threshold));
       }
 
-      if (binaryMat) binaryMat.delete();
-      binaryMat = new cv.Mat();
-      cv.threshold(blurMat, binaryMat, threshold, 255, thresholdType);
+      if (currentBinaryMat) currentBinaryMat.delete();
+      currentBinaryMat = new cv.Mat();
+      cv.threshold(blurMat, currentBinaryMat, threshold, 255, thresholdType);
 
       const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
-      if (cleanedMat) cleanedMat.delete();
-      cleanedMat = new cv.Mat();
-      cv.morphologyEx(binaryMat, cleanedMat, cv.MORPH_OPEN, kernel);
+      cv.morphologyEx(currentBinaryMat, currentBinaryMat, cv.MORPH_OPEN, kernel);
       kernel.delete();
 
-      drawMat(cleanedMat, 'canvas-mask');
+      drawMat(currentBinaryMat, 'canvas-mask');
+
+      countObjects(minArea);
+
+      drawThresholdLine(threshold);
+    }
+
+    function fillHoles() {
+      if (!currentBinaryMat) return;
+      const holes = new cv.Mat();
+      cv.bitwise_not(currentBinaryMat, holes);
+      const mask = new cv.Mat(holes.rows + 2, holes.cols + 2, cv.CV_8UC1, new cv.Scalar(0));
+      cv.floodFill(holes, mask, new cv.Point(0, 0), new cv.Scalar(0));
+      cv.bitwise_not(holes, holes);
+      cv.bitwise_or(currentBinaryMat, holes, currentBinaryMat);
+      holes.delete();
+      mask.delete();
+      drawMat(currentBinaryMat, 'canvas-mask');
+      countObjects(Math.max(parseInt(minAreaInput.value, 10) || 0, 0));
+    }
+
+    function countObjects(minArea) {
+      if (!currentBinaryMat || !srcMat) return;
+      const scale = Math.max(parseFloat(scaleInput.value) || 0, 0);
+      const minSize = Math.max(parseFloat(minSizeInput.value) || 0, 0);
+      const maxSizeRaw = Math.max(parseFloat(maxSizeInput.value) || 0, 0);
+      const limitedMax = maxSizeRaw === 0 ? Infinity : maxSizeRaw;
 
       const labels = new cv.Mat();
       const stats = new cv.Mat();
       const centroids = new cv.Mat();
-      const numComponents = cv.connectedComponentsWithStats(cleanedMat, labels, stats, centroids);
+      const numComponents = cv.connectedComponentsWithStats(currentBinaryMat, labels, stats, centroids);
 
       if (annotatedMat) annotatedMat.delete();
       annotatedMat = srcMat.clone();
@@ -280,29 +330,28 @@
       let count = 0;
       for (let i = 1; i < numComponents; i++) {
         const area = stats.intAt(i, cv.CC_STAT_AREA);
-        if (area < minArea) {
-          continue;
-        }
+        if (area < minArea) continue;
         const x = stats.intAt(i, cv.CC_STAT_LEFT);
         const y = stats.intAt(i, cv.CC_STAT_TOP);
         const w = stats.intAt(i, cv.CC_STAT_WIDTH);
         const h = stats.intAt(i, cv.CC_STAT_HEIGHT);
         const cx = centroids.doubleAt(i, 0);
         const cy = centroids.doubleAt(i, 1);
-        const color = new cv.Scalar(0, 255, 0, 255);
-        cv.rectangle(annotatedMat, new cv.Point(x, y), new cv.Point(x + w, y + h), color, 2);
+        const diameterPx = Math.sqrt((4 * area) / Math.PI);
+        const diameterReal = scale > 0 ? diameterPx * scale : diameterPx;
+        if (diameterReal < minSize || diameterReal > limitedMax) continue;
+        cv.rectangle(annotatedMat, new cv.Point(x, y), new cv.Point(x + w, y + h), new cv.Scalar(0, 255, 0, 255), 2);
         cv.circle(annotatedMat, new cv.Point(Math.round(cx), Math.round(cy)), 3, new cv.Scalar(0, 0, 255, 255), -1);
         count++;
       }
 
       drawMat(annotatedMat, 'canvas-annotated');
-      countLabel.textContent = `検出した対象数: ${count} / 閾値: ${threshold}`;
+      const unitLabel = scale > 0 ? '(単位換算)' : '(ピクセル)';
+      countLabel.textContent = `検出数: ${count} / スケール${unitLabel}: ${scale || 1}`;
 
       labels.delete();
       stats.delete();
       centroids.delete();
-
-      drawThresholdLine(threshold);
     }
 
     function handleFile(file) {
@@ -321,16 +370,19 @@
           srcMat = cv.imread(hiddenCanvas);
           grayMat = new cv.Mat();
           cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
+          invertedMat = new cv.Mat();
+          cv.bitwise_not(grayMat, invertedMat);
 
           drawMat(srcMat, 'canvas-original');
-          drawMat(grayMat, 'canvas-mask'); // 初期状態はグレースケールを表示
+          drawMat(invertedMat, 'canvas-mask');
           drawMat(srcMat, 'canvas-annotated');
 
-          updateHistogram(grayMat);
+          updateHistogram(invertedMat);
           drawThresholdLine(parseInt(thresholdSlider.value, 10));
 
           statusLabel.textContent = '閾値を調整して対象を検出してください。';
           enableControls(true);
+          fillButton.disabled = true; // 閾値適用まで無効
         };
         hiddenImage.src = event.target.result;
       };
@@ -354,16 +406,27 @@
 
     applyButton.addEventListener('click', () => {
       const threshold = parseInt(thresholdSlider.value, 10);
-      processImage(threshold, false);
+      processThreshold(threshold, false);
+      fillButton.disabled = false;
     });
 
     autoButton.addEventListener('click', () => {
-      processImage(0, true);
+      processThreshold(0, true);
+      fillButton.disabled = false;
     });
 
     minAreaInput.addEventListener('change', () => {
-      const threshold = parseInt(thresholdSlider.value, 10);
-      processImage(threshold, false);
+      countObjects(Math.max(parseInt(minAreaInput.value, 10) || 0, 0));
+    });
+
+    fillButton.addEventListener('click', () => {
+      fillHoles();
+    });
+
+    [scaleInput, minSizeInput, maxSizeInput].forEach(input => {
+      input.addEventListener('change', () => {
+        countObjects(Math.max(parseInt(minAreaInput.value, 10) || 0, 0));
+      });
     });
 
     function onOpenCvReady() {
